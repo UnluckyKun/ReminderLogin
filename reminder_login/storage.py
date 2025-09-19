@@ -46,6 +46,7 @@ class AppState:
     games: List[str] = field(default_factory=list)
     tracked_games: List[str] = field(default_factory=list)
     login_status: Dict[str, GameStatus] = field(default_factory=dict)
+    game_paths: Dict[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, object]:
         return {
@@ -54,6 +55,7 @@ class AppState:
             "login_status": {
                 game: status.to_dict() for game, status in self.login_status.items()
             },
+            "game_paths": {game: path for game, path in self.game_paths.items()},
         }
 
     @classmethod
@@ -71,7 +73,19 @@ class AppState:
             for game, status in raw_status.items():
                 login_status[str(game)] = GameStatus.from_dict(status, fallback_date=today)
 
-        return cls(games=games, tracked_games=tracked_games, login_status=login_status)
+        raw_paths = data.get("game_paths", {})
+        game_paths: Dict[str, str] = {}
+        if isinstance(raw_paths, dict):
+            for game, path in raw_paths.items():
+                if isinstance(game, str) and isinstance(path, str) and path:
+                    game_paths[game] = path
+
+        return cls(
+            games=games,
+            tracked_games=tracked_games,
+            login_status=login_status,
+            game_paths=game_paths,
+        )
 
 
 def current_date() -> str:
@@ -93,6 +107,7 @@ def default_state() -> AppState:
         games=list(DEFAULT_GAMES),
         tracked_games=list(DEFAULT_TRACKED),
         login_status={},
+        game_paths={},
     )
 
 
@@ -116,6 +131,11 @@ def load_state() -> AppState:
         state.games = list(DEFAULT_GAMES)
     if not state.tracked_games:
         state.tracked_games = list(DEFAULT_TRACKED)
+    state.game_paths = {
+        game: path
+        for game, path in state.game_paths.items()
+        if game in state.games and isinstance(path, str) and path
+    }
     return state
 
 
@@ -138,3 +158,6 @@ def ensure_today(state: AppState) -> None:
     for game in list(state.login_status.keys()):
         if game not in state.tracked_games:
             state.login_status.pop(game, None)
+    for game in list(state.game_paths.keys()):
+        if game not in state.games:
+            state.game_paths.pop(game, None)

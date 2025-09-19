@@ -1,15 +1,28 @@
 """Tkinter user interface for the Reminder Login helper."""
 from __future__ import annotations
 
+import csv
+import subprocess
+import sys
 import tkinter as tk
 from datetime import datetime, time, timedelta
-from tkinter import messagebox, ttk
-from typing import Dict, Optional
+from pathlib import Path
+from tkinter import filedialog, messagebox, ttk
+from typing import Dict, Optional, Set
 
+from .autostart import (
+    AutostartUnsupportedError,
+    autostart_destination_description,
+    disable_autostart,
+    enable_autostart,
+    is_autostart_enabled,
+    supports_autostart,
+)
 from .storage import AppState, GameStatus, ensure_today, load_state, save_state, current_date
 
 WINDOW_PADDING = 20
 TITLE = "Daily Login Reminder"
+PROCESS_POLL_INTERVAL_MS = 5000
 
 
 class ReminderApp:
@@ -35,10 +48,13 @@ class ReminderApp:
         self.checkbox_vars: Dict[str, tk.BooleanVar] = {}
         self.manage_window: Optional[tk.Toplevel] = None
         self.add_window: Optional[tk.Toplevel] = None
+        self.autostart_supported = supports_autostart()
+        self.autostart_var = tk.BooleanVar(value=is_autostart_enabled())
 
         self.build_main_view()
         self.root.after(200, self.position_window_top_right)
         self.schedule_midnight_reset()
+        self.root.after(PROCESS_POLL_INTERVAL_MS, self.poll_game_processes)
 
     # ------------------------------------------------------------------
     # Layout helpers
@@ -103,6 +119,22 @@ class ReminderApp:
         )
         reset_btn.pack(fill="x", pady=(10, 0))
 
+        autostart_frame = ttk.Frame(self.main_frame)
+        autostart_frame.pack(fill="x", pady=(8, 0))
+        if self.autostart_supported:
+            ttk.Checkbutton(
+                autostart_frame,
+                text="เปิดเองอัตโนมัติเมื่อเข้าสู่ระบบ",
+                variable=self.autostart_var,
+                command=self.on_toggle_autostart,
+            ).pack(anchor="w")
+        else:
+            ttk.Label(
+                autostart_frame,
+                text="ฟีเจอร์เริ่มอัตโนมัติยังไม่รองรับบนระบบนี้",
+                foreground="grey",
+            ).pack(anchor="w")
+
     def position_window_top_right(self) -> None:
         """Place the window on the top-right corner of the primary display."""
 
@@ -151,10 +183,63 @@ class ReminderApp:
 
         all_games = sorted(set(self.state.games), key=str.lower)
         vars_map: Dict[str, tk.BooleanVar] = {}
-        for game in all_games:
+        path_map: Dict[str, Optional[str]] = {
+            game: self.state.game_paths.get(game) for game in all_games
+        }
+        path_labels: Dict[str, ttk.Label] = {}
+
+        list_container = ttk.Frame(frame)
+        list_container.pack(fill="both", expand=True)
+
+        for row, game in enumerate(all_games):
+            item_frame = ttk.Frame(list_container)
+            item_frame.grid(row=row, column=0, sticky="ew", pady=3)
+            item_frame.columnconfigure(0, weight=1)
+            item_frame.columnconfigure(1, weight=0)
+            item_frame.columnconfigure(2, weight=0)
+
             var = tk.BooleanVar(value=game in self.state.tracked_games)
-            ttk.Checkbutton(frame, text=game, variable=var).pack(anchor="w", pady=2)
             vars_map[game] = var
+
+            ttk.Checkbutton(item_frame, text=game, variable=var).grid(
+                row=0, column=0, sticky="w"
+            )
+
+            def select_file(target: str = game) -> None:
+                filename = filedialog.askopenfilename(
+                    parent=window,
+                    title=f"เลือกไฟล์สำหรับ {target}",
+                )
+                if filename:
+                    path_map[target] = filename
+                    path_labels[target].config(
+                        text=self.format_path_label(filename),
+                        foreground="#1a1a1a",
+                    )
+
+            def clear_file(target: str = game) -> None:
+                path_map[target] = None
+                path_labels[target].config(
+                    text=self.format_path_label(None),
+                    foreground="grey",
+                )
+
+            ttk.Button(item_frame, text="เลือกไฟล์…", command=select_file).grid(
+                row=0, column=1, padx=(6, 0), sticky="e"
+            )
+            ttk.Button(item_frame, text="ล้าง", command=clear_file).grid(
+                row=0, column=2, padx=(4, 0), sticky="e"
+            )
+
+            label = ttk.Label(
+                item_frame,
+                text=self.format_path_label(path_map[game]),
+                foreground="grey" if not path_map[game] else "#1a1a1a",
+                wraplength=360,
+                justify="left",
+            )
+            label.grid(row=1, column=0, columnspan=3, sticky="w", padx=(24, 0), pady=(2, 0))
+            path_labels[game] = label
 
         button_row = ttk.Frame(frame)
         button_row.pack(fill="x", pady=(10, 0))
@@ -169,6 +254,11 @@ class ReminderApp:
                 ):
                     return
             self.state.tracked_games = selected
+            self.state.game_paths = {
+                game: path
+                for game, path in path_map.items()
+                if path and game in self.state.games
+            }
             ensure_today(self.state)
             save_state(self.state)
             self.build_main_view()
@@ -209,6 +299,22 @@ class ReminderApp:
         track_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(frame, text="ติดตามเกมนี้เลย", variable=track_var).pack(anchor="w")
 
+        path_var = tk.StringVar()
+        ttk.Label(frame, text="ไฟล์เกม (ไม่บังคับ)").pack(anchor="w", pady=(10, 2))
+        path_row = ttk.Frame(frame)
+        path_row.pack(fill="x")
+        path_entry = ttk.Entry(path_row, textvariable=path_var)
+        path_entry.pack(side="left", expand=True, fill="x")
+
+        def browse_file() -> None:
+            filename = filedialog.askopenfilename(parent=window, title="เลือกไฟล์เกม")
+            if filename:
+                path_var.set(filename)
+
+        ttk.Button(path_row, text="เลือกไฟล์…", command=browse_file).pack(
+            side="left", padx=(6, 0)
+        )
+
         status_label = ttk.Label(frame, foreground="red")
         status_label.pack(anchor="w", pady=(6, 0))
 
@@ -223,6 +329,13 @@ class ReminderApp:
             self.state.games.append(name)
             if track_var.get() and name not in self.state.tracked_games:
                 self.state.tracked_games.append(name)
+            selected_path = path_var.get().strip()
+            if selected_path:
+                path_obj = Path(selected_path)
+                if not path_obj.exists():
+                    status_label.config(text="หาไฟล์นี้ไม่พบ ลองเลือกใหม่อีกครั้ง")
+                    return
+                self.state.game_paths[name] = str(path_obj)
             ensure_today(self.state)
             save_state(self.state)
             self.build_main_view()
@@ -265,6 +378,135 @@ class ReminderApp:
         save_state(self.state)
         self.build_main_view()
         self.schedule_midnight_reset()
+
+    def on_toggle_autostart(self) -> None:
+        """Enable or disable launching on login based on the checkbox state."""
+
+        desired = bool(self.autostart_var.get())
+        if not self.autostart_supported:
+            messagebox.showerror(
+                "ไม่รองรับ",
+                "ระบบปฏิบัติการนี้ยังไม่รองรับการตั้งค่าให้เปิดอัตโนมัติ",
+                parent=self.root,
+            )
+            self.autostart_var.set(False)
+            return
+
+        try:
+            if desired:
+                entry = enable_autostart()
+                location = autostart_destination_description()
+                message = "ตั้งค่าให้เปิดอัตโนมัติเรียบร้อยแล้ว"
+                if location:
+                    message += f"\nไฟล์กำหนดอยู่ที่:\n{location}"
+                messagebox.showinfo("สำเร็จ", message, parent=self.root)
+            else:
+                disable_autostart()
+                messagebox.showinfo(
+                    "สำเร็จ",
+                    "ปิดการเริ่มอัตโนมัติแล้ว",
+                    parent=self.root,
+                )
+        except AutostartUnsupportedError as exc:
+            messagebox.showerror("ไม่รองรับ", str(exc), parent=self.root)
+            self.autostart_var.set(False)
+        except OSError as exc:
+            messagebox.showerror("ผิดพลาด", str(exc), parent=self.root)
+            self.autostart_var.set(is_autostart_enabled())
+        else:
+            self.autostart_var.set(is_autostart_enabled())
+
+    def poll_game_processes(self) -> None:
+        """Check running processes and tick games that are currently open."""
+
+        try:
+            tracked = [
+                (game, self.state.game_paths.get(game))
+                for game in self.state.tracked_games
+            ]
+        except Exception:  # pragma: no cover - defensive
+            tracked = []
+
+        tracked = [(game, path) for game, path in tracked if path]
+        if tracked:
+            running = self.list_running_process_names()
+            if running:
+                today = current_date()
+                changed = False
+                for game, path in tracked:
+                    candidates = self.possible_process_names(path)
+                    if any(candidate in running for candidate in candidates):
+                        status = self.state.login_status.get(game)
+                        if status is None or status.date != today or not status.logged:
+                            self.state.login_status[game] = GameStatus(
+                                date=today, logged=True
+                            )
+                            checkbox_var = self.checkbox_vars.get(game)
+                            if checkbox_var is not None:
+                                checkbox_var.set(True)
+                            changed = True
+                if changed:
+                    save_state(self.state)
+
+        self.root.after(PROCESS_POLL_INTERVAL_MS, self.poll_game_processes)
+
+    @staticmethod
+    def list_running_process_names() -> Set[str]:
+        """Return a set with the lowercase names of currently running processes."""
+
+        if sys.platform == "win32":
+            try:
+                result = subprocess.run(
+                    ["tasklist", "/fo", "csv", "/nh"],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+            except OSError:
+                return set()
+            reader = csv.reader(result.stdout.splitlines())
+            return {row[0].strip().lower() for row in reader if row}
+
+        try:
+            result = subprocess.run(
+                ["ps", "-A", "-o", "comm="],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        except OSError:
+            return set()
+        names: Set[str] = set()
+        for line in result.stdout.splitlines():
+            name = line.strip()
+            if not name:
+                continue
+            names.add(Path(name).name.lower())
+        return names
+
+    @staticmethod
+    def possible_process_names(path: str) -> Set[str]:
+        """Derive candidate process names for a given executable path."""
+
+        candidate = Path(path)
+        names = {candidate.name.lower()}
+        stem = candidate.stem.lower()
+        if stem:
+            names.add(stem)
+        if candidate.suffix.lower() == ".app":
+            names.add(candidate.stem.lower())
+        return {name for name in names if name}
+
+    @staticmethod
+    def format_path_label(path: Optional[str]) -> str:
+        """Return a friendly label for the selected executable path."""
+
+        if not path:
+            return "ยังไม่ได้ตั้งค่าไฟล์สำหรับตรวจจับอัตโนมัติ"
+        display = str(Path(path))
+        if len(display) > 70:
+            display = f"…{display[-67:]}"
+        return f"ไฟล์ที่ใช้ตรวจจับ: {display}"
 
     # ------------------------------------------------------------------
     # Main loop
